@@ -1230,7 +1230,7 @@ fn services(
                 let (tx, rx) = std::sync::mpsc::channel();
                 let wake = search_ctx.clone();
                 let spawned = std::thread::Builder::new().name("imap search".into()).spawn(move || {
-                    mailcraft_net::imap_search::search(
+                    mailcraft_net::imap_search::search_from(
                         &job.account,
                         &job.secret,
                         job.ticket,
@@ -1238,6 +1238,7 @@ fn services(
                         &job.query,
                         &job.known,
                         job.gmail_all,
+                        &job.next,
                         |page| {
                             let _ = tx.send(page);
                             wake.request_repaint();

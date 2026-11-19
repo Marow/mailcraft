@@ -214,7 +214,14 @@ fn the_newest_uids_are_kept_when_the_answer_is_longer_than_the_cap() {
     search(&account_on(imap.port), "hunter2", 9, &["INBOX".into()], "x", &known, false, |page| pages.push(page));
     assert!(pages[0].errors.is_empty(), "{:?}", pages[0].errors);
     assert_eq!(pages[0].messages.iter().map(|m| m.server.id.as_str()).collect::<Vec<_>>(), ["imap:11:1001"]);
-    assert!(pages[0].capped, "an older unknown UID past the newest thousand is not in this answer");
+    // An older message past the newest thousand is not in this answer: the answer says where the
+    // search goes on, and the next page asks below it.
+    assert!(!pages[0].capped && !pages[0].partial);
+    assert_eq!(pages[0].next, "2 INBOX");
+    let mut older = Vec::new();
+    super::search_from(&account_on(imap.port), "hunter2", 9, &["INBOX".into()], "x", &none_known(), false, &pages[0].next, |page| older.push(page));
+    assert_eq!(older[0].messages.iter().map(|m| m.server.id.as_str()).collect::<Vec<_>>(), ["imap:11:1"]);
+    assert!(older[0].next.is_empty() && !older[0].capped);
 }
 
 #[test]
@@ -387,4 +394,80 @@ fn a_late_inbox_is_asked_first_and_is_not_the_folder_left_out() {
     assert_eq!(asked.len(), 24);
     assert_eq!(asked[0], "INBOX");
     assert!(left_out);
+}
+
+/// A mailbox with `count` messages in INBOX that say "budget", UIDs from 1, and one in Archive.
+fn many(count: u32) -> Fake<ImapWorld> {
+    let message = |uid: u32, subject: &str| FakeMessage {
+        uid,
+        flags: String::new(),
+        internal_date: " 1-Jul-2003 09:52:37 +0000".into(),
+        body: format!("From: Ada <ada@example.org>\r\nSubject: {subject}\r\n\r\nAbout the budget.\r\n").into_bytes(),
+        claimed_size: None,
+    };
+    let mailbox = |raw: &str, validity: u32, messages: Vec<FakeMessage>| FakeMailbox {
+        raw: raw.into(),
+        flags: "\\HasNoChildren".into(),
+        uid_validity: validity,
+        messages,
+        refuse_open: false,
+        next_uid: 0,
+    };
+    Fake::imap(ImapWorld {
+        user: "ada".into(),
+        password: "hunter2".into(),
+        mailboxes: vec![
+            mailbox("INBOX", 11, (1..=count).map(|uid| message(uid, &format!("Line {uid}"))).collect()),
+            mailbox("Archive", 12, vec![message(1, "Old budget")]),
+        ],
+        ..Default::default()
+    })
+}
+
+#[test]
+fn a_search_goes_on_from_where_the_last_page_ended_until_every_match_was_given_once() {
+    let imap = many(95);
+    let folders = ["INBOX".to_string(), "Archive".to_string()];
+    let account = account_on(imap.port);
+    let (mut next, mut all, mut pages) = (String::new(), Vec::new(), 0);
+    loop {
+        let mut answers = Vec::new();
+        super::search_from(&account, "hunter2", 9, &folders, "budget", &none_known(), false, &next, |page| answers.push(page));
+        let last = answers.last().unwrap();
+        assert!(!last.partial && answers.iter().all(|a| a.errors.is_empty() && !a.capped), "{answers:?}");
+        let found: Vec<String> = answers.iter().flat_map(|a| a.messages.iter().map(|m| m.server.id.clone())).collect();
+        assert!(found.len() <= 40, "a page at a time");
+        all.extend(found);
+        next = last.next.clone();
+        pages += 1;
+        if next.is_empty() || pages > 10 {
+            break;
+        }
+    }
+    // 95 in the Inbox, newest first, 40 to a page, and the one in Archive after them.
+    assert_eq!(pages, 3);
+    assert_eq!(all.len(), 96);
+    assert_eq!(all.first().map(String::as_str), Some("imap:11:95"));
+    assert_eq!(all.last().map(String::as_str), Some("imap:12:1"));
+    let mut once = all.clone();
+    once.sort();
+    once.dedup();
+    assert_eq!(once.len(), 96);
+}
+
+#[test]
+fn a_place_that_is_none_begins_at_the_start_and_a_folder_no_longer_asked_ends_the_search() {
+    let imap = many(3);
+    let account = account_on(imap.port);
+    let ask = |folders: &[&str], next: &str| {
+        let folders: Vec<String> = folders.iter().map(|f| (*f).to_string()).collect();
+        let mut answers = Vec::new();
+        super::search_from(&account, "hunter2", 9, &folders, "budget", &none_known(), false, next, |page| answers.push(page));
+        answers.iter().flat_map(|a| a.messages.iter().map(|m| m.server.id.clone())).collect::<Vec<_>>()
+    };
+    assert_eq!(ask(&["INBOX"], "junk").len(), 3);
+    assert_eq!(ask(&["INBOX"], "3 INBOX"), ["imap:11:2", "imap:11:1"]);
+    assert_eq!(ask(&["INBOX"], "1 INBOX").len(), 0);
+    assert!(ask(&["INBOX"], "2 Elsewhere").is_empty());
+    assert_eq!(ask(&["INBOX", "Archive"], "0 Archive"), ["imap:12:1"]);
 }

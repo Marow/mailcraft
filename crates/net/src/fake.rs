@@ -923,7 +923,13 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
             // and Gmail's `UID SEARCH UID <set> UNDELETED X-GM-RAW "category:…"`: the searches
             // asked of a server.
             "UID" if args.to_ascii_uppercase().starts_with("SEARCH ") => {
-                let said = words(args);
+                let mut said = words(args);
+                // `UID SEARCH UNDELETED UID <set> …`: the search among those messages alone.
+                let among = (said.get(2).is_some_and(|w| w.eq_ignore_ascii_case("UID")) && said.len() > 3).then(|| said.remove(3));
+                if among.is_some() {
+                    said.remove(2);
+                }
+                let within = |uid: u32| among.as_ref().is_none_or(|set| in_set(set, uid));
                 let asked = |at: usize, word: &str| said.get(at).is_some_and(|w| w.eq_ignore_ascii_case(word));
                 let texts: Vec<String> =
                     said.windows(2).filter(|pair| pair[0].eq_ignore_ascii_case("TEXT")).map(|pair| pair[1].to_ascii_lowercase()).collect();
@@ -935,7 +941,7 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                             let found: String = mailbox
                                 .messages
                                 .iter()
-                                .filter(|m| !m.has("\\Deleted"))
+                                .filter(|m| !m.has("\\Deleted") && within(m.uid))
                                 .filter(|m| {
                                     let body = String::from_utf8_lossy(&m.body).to_ascii_lowercase();
                                     texts.iter().all(|word| body.contains(word))
@@ -983,7 +989,7 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                                 let found: String = mailbox
                                     .messages
                                     .iter()
-                                    .filter(|m| !m.has("\\Deleted"))
+                                    .filter(|m| !m.has("\\Deleted") && within(m.uid))
                                     .filter(|m| {
                                         let raw = String::from_utf8_lossy(&m.body).to_ascii_lowercase();
                                         let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
@@ -1009,7 +1015,7 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                         let found: String = mailbox
                             .messages
                             .iter()
-                            .filter(|m| !m.has("\\Deleted") && header_has(&m.body, &said[3], &said[4]))
+                            .filter(|m| !m.has("\\Deleted") && within(m.uid) && header_has(&m.body, &said[3], &said[4]))
                             .map(|m| format!(" {}", m.uid))
                             .collect();
                         reply.extend(format!("* SEARCH{found}\r\n{tag} OK found\r\n").bytes());

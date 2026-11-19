@@ -1113,10 +1113,22 @@ impl<S: Read + Write> Imap<S> {
     /// answer names more than [`MAX_FOUND`]: a later UID is the newer message, and the caller
     /// hears that the answer was cut (`true`).
     pub fn uid_search_clauses_newest(&mut self, clauses: &[(&str, Option<&str>, &str)]) -> Result<(Vec<u32>, bool), ProtoError> {
+        self.uid_search_clauses_below(clauses, None)
+    }
+
+    /// [`uid_search_clauses_newest`](Self::uid_search_clauses_newest) among the messages whose UID
+    /// is lower than `below`, when one is given: how a search that was cut goes on with the
+    /// older messages.
+    pub fn uid_search_clauses_below(&mut self, clauses: &[(&str, Option<&str>, &str)], below: Option<u32>) -> Result<(Vec<u32>, bool), ProtoError> {
         if clauses.is_empty() || clauses.len() > 8 {
             return Err(ProtoError::Protocol(said!("the text can't be looked for on the server")));
         }
         let mut command = Command::new(search_verb(&clauses.iter().map(|(_, _, text)| *text).collect::<Vec<_>>()));
+        if let Some(below) = below {
+            // (No message has a UID below 1: nothing is asked.)
+            let Some(highest) = below.checked_sub(1).filter(|highest| *highest >= 1) else { return Ok((Vec::new(), false)) };
+            command = command.arg("UID").arg(&format!("1:{highest}"));
+        }
         for (key, header, text) in clauses {
             if !search_text(text) {
                 return Err(ProtoError::Protocol(said!("the text can't be looked for on the server")));

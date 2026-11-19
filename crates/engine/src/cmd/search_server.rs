@@ -271,6 +271,7 @@ pub fn apply(s: &mut Session, result: GraphSearchResult) -> CmdResult {
     if !result.email.is_empty() && !a.email.trim().eq_ignore_ascii_case(result.email.trim()) {
         return Err(failed!("these results were for another mailbox, not for {name}", name = a.name));
     }
+    let by_few_pages = a.kind == AccountKind::Microsoft;
     let Some(at) = s.server_search.mailboxes.iter().position(|m| m.account == account) else {
         return Ok(json!({"taken": 0, "stale": true}));
     };
@@ -368,7 +369,9 @@ pub fn apply(s: &mut Session, result: GraphSearchResult) -> CmdResult {
             // No more: the last page came, or the mailbox won't be searched for the owner at all.
             // (Busy, unreachable or another trouble: the owner may ask again.)
             m.done = (result.next.is_empty() && result.errors.is_empty()) || result.refused.is_some();
-            if search.results.len() >= 200 {
+            // (A Microsoft mailbox's search is a few pages and no more; one that is asked a
+            // page at a time, with the owner's click for each, goes on while it has more.)
+            if by_few_pages && search.results.len() >= 200 {
                 m.done = true;
                 m.next.clear();
             }
