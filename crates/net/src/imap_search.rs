@@ -24,6 +24,9 @@ const MAX_FOLDERS: usize = 24;
 const MAX_HITS: usize = 40;
 /// Most words of the query sent. The rest is checked here against what comes back.
 const MAX_WORDS: usize = 6;
+/// Most messages of one account fetched whole to be checked here. A long query over a big folder
+/// stops there, and the page says the search was cut short.
+const MAX_CHECKED: usize = 200;
 
 /// Search `folders` of `account` (names as the server knows them) for `query`. `known` is the
 /// UIDs already on this computer, by folder name: they are not counted toward the hit limit.
@@ -56,7 +59,7 @@ pub fn search(
         }
     };
     let (folders, folders_left) = chosen(folders, gmail_all);
-    let mut hits = 0usize;
+    let (mut hits, mut checked) = (0usize, 0usize);
     let last = folders.len().saturating_sub(1);
     for (at, folder) in folders.iter().enumerate() {
         if hits >= MAX_HITS {
@@ -136,7 +139,12 @@ pub fn search(
                 }
             }
             let whole = check.iter().any(Left::needs_body);
+            if whole && checked >= MAX_CHECKED {
+                stopped = true;
+                break;
+            }
             if whole {
+                checked = checked.saturating_add(1);
                 let size = match imap.uid_fetch_sizes(&uid.to_string()) {
                     Ok(sizes) => sizes.into_iter().find(|(found, _)| *found == uid).map(|(_, size)| size).unwrap_or(0),
                     Err(e) => {
@@ -261,7 +269,10 @@ fn clauses(query: &str) -> (Vec<Clause>, Vec<Left>) {
             }
             ServerTerm::HasAttachment if !full => {
                 // `TEXT` sees the phrase in a nested part; `HEADER` only sees the top-level header.
+                // It narrows the search and proves nothing: a message that only quotes the phrase
+                // matches too, so what comes back is looked at before it is a hit.
                 out.push(Clause { key: "TEXT", header: None, text: "Content-Disposition: attachment".into() });
+                left.push(Left::HasAttachment);
             }
             ServerTerm::HasAttachment => left.push(Left::HasAttachment),
             ServerTerm::Importance(importance @ (Importance::High | Importance::Low)) if !full => {
@@ -324,8 +335,11 @@ fn chosen(folders: &[String], gmail_all: bool) -> (Vec<String>, bool) {
         return (vec![all.clone()], false);
     }
     let eligible = folders.iter().filter(|name| !name.is_empty()).count();
-    let mut names: Vec<String> = folders.iter().filter(|name| !name.is_empty()).take(MAX_FOLDERS).cloned().collect();
+    // The Inbox first, wherever it stands in the list, and then the limit: a late Inbox is not
+    // the folder that is left out.
+    let mut names: Vec<String> = folders.iter().filter(|name| !name.is_empty()).cloned().collect();
     names.sort_by_key(|name| !name.eq_ignore_ascii_case("INBOX"));
+    names.truncate(MAX_FOLDERS);
     (names, eligible > MAX_FOLDERS)
 }
 

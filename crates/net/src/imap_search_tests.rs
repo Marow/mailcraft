@@ -254,7 +254,8 @@ fn an_attachment_in_a_nested_part_is_found() {
         --b\r\nContent-Type: text/plain\r\n\r\nThe board shipped.\r\n\
         --b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"note.pdf\"\r\n\r\n%PDF\r\n\
         --b--\r\n";
-    let plain = b"From: Ada <ada@example.org>\r\nSubject: board\r\n\r\nThe board shipped.\r\n";
+    // (One that only quotes the phrase a server is asked for is no message with an attachment.)
+    let plain = b"From: Ada <ada@example.org>\r\nSubject: board\r\n\r\nThe board shipped.\r\n> Content-Disposition: attachment\r\n";
     let imap = Fake::imap(ImapWorld {
         user: "ada".into(),
         password: "hunter2".into(),
@@ -376,4 +377,14 @@ fn folders_past_the_limit_keep_the_search_open() {
     assert!(pages.iter().all(|page| page.errors.is_empty()), "{pages:?}");
     assert!(pages.iter().all(|page| page.messages.is_empty()), "the folder past the limit was not asked");
     assert!(pages.last().is_some_and(|page| page.capped), "folders left out are said");
+}
+
+#[test]
+fn a_late_inbox_is_asked_first_and_is_not_the_folder_left_out() {
+    let mut folders: Vec<String> = (0..40).map(|n| format!("Folder {n}")).collect();
+    folders.push("INBOX".into());
+    let (asked, left_out) = super::chosen(&folders, false);
+    assert_eq!(asked.len(), 24);
+    assert_eq!(asked[0], "INBOX");
+    assert!(left_out);
 }
