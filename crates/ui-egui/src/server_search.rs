@@ -113,6 +113,8 @@ pub struct ImapSearchJob {
     pub known: HashMap<String, HashSet<u32>>,
     /// Gmail, and the search is the whole mailbox: All Mail is asked once when that folder is here.
     pub gmail_all: bool,
+    /// Where the search goes on from, as the last page of it said; empty for the first.
+    pub next: String,
 }
 
 /// One IMAP message to fetch whole. The secret is never written out and never shown.
@@ -250,7 +252,8 @@ impl MailApp {
         let folders = imap_folders(&self.session, request.account, &request.folder);
         let known = known_uids(&self.session, request.account, &folders);
         let gmail_all = request.folder.is_empty() && is_gmail(&account);
-        let rx = search(ImapSearchJob { account, secret, ticket: request.ticket, folders, query: request.query, known, gmail_all });
+        let job = ImapSearchJob { account, secret, ticket: request.ticket, folders, query: request.query, known, gmail_all, next: request.next };
+        let rx = search(job);
         self.server_searching.pending.push(Pending { unreached, rx, settled: false });
     }
 

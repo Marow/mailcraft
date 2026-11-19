@@ -6,7 +6,13 @@
 //! connection, and each folder's hits are handed back as soon as they arrive (`partial`), so a
 //! window can show them while another account, on its own connection, is still being searched.
 //! Gmail is asked folder by folder like any other account: All Mail is not a folder kept here, so
-//! a search of it cannot be placed. Nothing of the query or of a password is written to a log line.
+//! a search of it cannot be placed.
+//!
+//! A search is a page at a time. When a page has its hits ([`MAX_HITS`]), or as many messages
+//! were fetched whole to be checked as one page may ([`MAX_CHECKED`]), or the server named more
+//! matches than one answer takes, the last answer says where the search stands
+//! ([`GraphSearchResult::next`]: the folder, and the UID the older messages lie below), and the
+//! next request goes on from there ([`search_from`]) instead of starting over. Nothing of the query or of a password is written to a log line.
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,6 +30,9 @@ const MAX_FOLDERS: usize = 24;
 const MAX_HITS: usize = 40;
 /// Most words of the query sent. The rest is checked here against what comes back.
 const MAX_WORDS: usize = 6;
+/// Most messages of one account fetched whole to be checked here. A long query over a big folder
+/// stops there, and the page says the search was cut short.
+const MAX_CHECKED: usize = 200;
 
 /// Search `folders` of `account` (names as the server knows them) for `query`. `known` is the
 /// UIDs already on this computer, by folder name: they are not counted toward the hit limit.
@@ -37,6 +46,30 @@ pub fn search(
     query: &str,
     known: &HashMap<String, HashSet<u32>>,
     gmail_all: bool,
+    on_page: impl FnMut(GraphSearchResult),
+) {
+    search_from(account, secret, ticket, folders, query, known, gmail_all, "", on_page);
+}
+
+/// Where a search goes on from, as [`GraphSearchResult::next`] carries it: the UID the messages
+/// still to look at lie below (0: the whole folder), and the folder's name.
+fn place(next: &str) -> Option<(u32, &str)> {
+    let (below, folder) = next.split_once(' ')?;
+    Some((below.parse().ok()?, folder)).filter(|(_, folder)| !folder.is_empty())
+}
+
+/// [`search`] from where an earlier page ended (`next`, as its last answer said; empty: from the
+/// start).
+#[allow(clippy::too_many_arguments)]
+pub fn search_from(
+    account: &Account,
+    secret: &str,
+    ticket: u64,
+    folders: &[String],
+    query: &str,
+    known: &HashMap<String, HashSet<u32>>,
+    gmail_all: bool,
+    next: &str,
     mut on_page: impl FnMut(GraphSearchResult),
 ) {
     let mut base = GraphSearchResult { account: account.id, email: account.email.clone(), ticket, ..Default::default() };
@@ -56,9 +89,24 @@ pub fn search(
         }
     };
     let (folders, folders_left) = chosen(folders, gmail_all);
-    let mut hits = 0usize;
+    // The folder an earlier page ended in, and how far into it. One that isn't asked about any
+    // more leaves nothing to go on with.
+    let (first, mut below) = match place(next) {
+        Some((below, name)) => match folders.iter().position(|folder| folder == name) {
+            Some(at) => (at, below),
+            None => {
+                on_page(base);
+                let _ = imap.logout();
+                return;
+            }
+        },
+        None => (0, 0),
+    };
+    let (mut hits, mut checked) = (0usize, 0usize);
     let last = folders.len().saturating_sub(1);
-    for (at, folder) in folders.iter().enumerate() {
+    for (at, folder) in folders.iter().enumerate().skip(first) {
+        // (Only the folder the last page ended in is taken up part of the way.)
+        let below_here = std::mem::take(&mut below);
         if hits >= MAX_HITS {
             break;
         }
@@ -88,13 +136,15 @@ pub fn search(
         };
         let clause_refs: Vec<(&str, Option<&str>, &str)> = asked.iter().map(|c| (c.key, c.header, c.text.as_str())).collect();
         let gmail = gmail_all && is_all_mail(folder);
+        let older = (below_here > 0).then_some(below_here);
         let uids = if gmail {
+            let set = older.map_or("1:*".to_string(), |below| format!("1:{}", below.saturating_sub(1).max(1)));
             match gmail_query(&asked) {
-                Some(query) => imap.uid_search_gmail("1:*", &query).map(|uids| (uids, false)),
-                None => imap.uid_search_clauses_newest(&clause_refs),
+                Some(query) => imap.uid_search_gmail(&set, &query).map(|uids| (uids, false)),
+                None => imap.uid_search_clauses_below(&clause_refs, older),
             }
         } else {
-            imap.uid_search_clauses_newest(&clause_refs)
+            imap.uid_search_clauses_below(&clause_refs, older)
         };
         let (uids, truncated) = match uids {
             Ok(uids) => uids,
@@ -112,7 +162,10 @@ pub fn search(
         // A higher UID is the newer message. The limit then keeps the newest, not the oldest.
         uids.sort_unstable_by(|a, b| b.cmp(a));
         let held = known.get(folder.as_str());
-        let mut stopped = false;
+        // The oldest the server named: when its answer was cut, the search goes on below it.
+        let oldest = uids.last().copied();
+        // Where this page stops in the folder, when it does: at a message not looked at yet.
+        let mut stopped: Option<u32> = None;
         // A message larger than a synchronisation will fetch cannot be checked for a word that
         // lives in its body. It is left out, and the page says the search was cut short.
         let mut oversized = false;
@@ -120,8 +173,12 @@ pub fn search(
             if held.is_some_and(|uids| uids.contains(&uid)) {
                 continue;
             }
+            // (A Gmail search of a set may name the set's last message when the set is empty.)
+            if older.is_some_and(|below| uid >= below) {
+                continue;
+            }
             if hits >= MAX_HITS {
-                stopped = true;
+                stopped = Some(uid);
                 break;
             }
             // Words past the six the server was asked, and a Gmail search that cannot say
@@ -136,7 +193,12 @@ pub fn search(
                 }
             }
             let whole = check.iter().any(Left::needs_body);
+            if whole && checked >= MAX_CHECKED {
+                stopped = Some(uid);
+                break;
+            }
             if whole {
+                checked = checked.saturating_add(1);
                 let size = match imap.uid_fetch_sizes(&uid.to_string()) {
                     Ok(sizes) => sizes.into_iter().find(|(found, _)| *found == uid).map(|(_, size)| size).unwrap_or(0),
                     Err(e) => {
@@ -185,9 +247,19 @@ pub fn search(
                 hits += 1;
             }
         }
-        let more_folders = at != last && hits < MAX_HITS && !stopped;
+        // Where the next page begins, when this one ends before the search does: at the
+        // message it stopped at, below the oldest of an answer the server cut, or at the next
+        // folder when the page is full.
+        let go_on = match (stopped, truncated.then_some(oldest).flatten()) {
+            (Some(uid), _) => Some(format!("{} {folder}", uid.saturating_add(1))),
+            (None, Some(oldest)) if oldest > 1 => Some(format!("{oldest} {folder}")),
+            _ => folders.get(at.saturating_add(1)).filter(|_| hits >= MAX_HITS).map(|following| format!("0 {following}")),
+        };
+        let more_folders = at != last && go_on.is_none();
         page.partial = more_folders;
-        page.capped = stopped || truncated || oversized || folders_left || (hits >= MAX_HITS && at != last);
+        page.next = go_on.unwrap_or_default();
+        // What no further page brings: a message too large to be checked, folders past the limit.
+        page.capped = oversized || folders_left;
         on_page(page);
         if !more_folders {
             let _ = imap.logout();
@@ -261,7 +333,10 @@ fn clauses(query: &str) -> (Vec<Clause>, Vec<Left>) {
             }
             ServerTerm::HasAttachment if !full => {
                 // `TEXT` sees the phrase in a nested part; `HEADER` only sees the top-level header.
+                // It narrows the search and proves nothing: a message that only quotes the phrase
+                // matches too, so what comes back is looked at before it is a hit.
                 out.push(Clause { key: "TEXT", header: None, text: "Content-Disposition: attachment".into() });
+                left.push(Left::HasAttachment);
             }
             ServerTerm::HasAttachment => left.push(Left::HasAttachment),
             ServerTerm::Importance(importance @ (Importance::High | Importance::Low)) if !full => {
@@ -324,8 +399,11 @@ fn chosen(folders: &[String], gmail_all: bool) -> (Vec<String>, bool) {
         return (vec![all.clone()], false);
     }
     let eligible = folders.iter().filter(|name| !name.is_empty()).count();
-    let mut names: Vec<String> = folders.iter().filter(|name| !name.is_empty()).take(MAX_FOLDERS).cloned().collect();
+    // The Inbox first, wherever it stands in the list, and then the limit: a late Inbox is not
+    // the folder that is left out.
+    let mut names: Vec<String> = folders.iter().filter(|name| !name.is_empty()).cloned().collect();
     names.sort_by_key(|name| !name.eq_ignore_ascii_case("INBOX"));
+    names.truncate(MAX_FOLDERS);
     (names, eligible > MAX_FOLDERS)
 }
 

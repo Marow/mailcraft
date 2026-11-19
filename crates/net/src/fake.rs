@@ -347,6 +347,10 @@ pub(crate) struct ImapWorld {
     pub(crate) gmail_categories: Vec<(String, u32, String)>,
     /// Gmail's search finds messages marked as deleted too, `UNDELETED` or not.
     pub(crate) gmail_finds_deleted: bool,
+    /// For a server that behaves as Gmail does: the mailbox, the UID and what goes between the
+    /// parentheses of `X-GM-LABELS (…)` for each message that has labels (#1153), as it stands, so
+    /// that a test can write anything there; a message not named has `X-GM-LABELS ()`.
+    pub(crate) gmail_labels: Vec<(String, u32, String)>,
     /// Don't know STATUS: answer BAD to it, as a very old server would.
     pub(crate) no_status: bool,
     /// Know IDLE (RFC 2177), and say so. While a client idles, every line in `idle_events` is
@@ -410,12 +414,17 @@ pub(crate) struct SmtpWorld {
     pub(crate) password: String,
     /// Offer AUTH PLAIN and LOGIN, and insist on a sign-in before taking mail.
     pub(crate) auth: bool,
+    /// With `auth`: offer a sign-in and take mail without one all the same (a relay).
+    pub(crate) auth_optional: bool,
     /// The access token that signs `user` in (XOAUTH2, insisted on likewise); empty for a server that takes none.
     pub(crate) token: String,
     /// Say STARTTLS is on offer (it isn't: what follows the go-ahead is no handshake).
     pub(crate) offer_starttls: bool,
     /// Recipients to answer 550 for.
     pub(crate) refuse: Vec<String>,
+    /// With `auth` and `auth_optional`: take MAIL FROM, then refuse every recipient of a connection that hasn't
+    /// signed in as a relay does ("Relay access denied").
+    pub(crate) deny_relay: bool,
     pub(crate) delivered: Vec<Delivery>,
     /// Every line received (not the messages).
     pub(crate) log: Vec<String>,
@@ -673,7 +682,9 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                 let given = words(args);
                 if given == [world.user.clone(), world.password.clone()] {
                     signed_in = true;
-                    reply.extend(format!("{tag} OK welcome\r\n").bytes());
+                    // The list restated in the OK, as a server whose list doesn't change may: the
+                    // client need not ask again to know what is offered once signed in.
+                    reply.extend(format!("{tag} OK [CAPABILITY {}] welcome\r\n", world.capabilities(secured)).bytes());
                 } else {
                     // A careless server: it repeats the password it was sent.
                     let password = given.get(1).cloned().unwrap_or_default();
@@ -684,6 +695,7 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                 let (mechanism, with_command) = args.split_once(' ').unwrap_or((args, ""));
                 if world.plain && mechanism.eq_ignore_ascii_case("PLAIN") {
                     let (user, password) = (world.user.clone(), world.password.clone());
+                    let caps = world.capabilities(secured);
                     drop(world);
                     let payload = if with_command.is_empty() {
                         let _ = reader.get_mut().write_all(b"+ \r\n");
@@ -695,7 +707,7 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                     };
                     let expected = mailcraft_charset::base64::STANDARD.encode(format!("\0{user}\0{password}").as_bytes());
                     signed_in = payload == expected;
-                    let verdict = if signed_in { "OK welcome" } else { "NO [AUTHENTICATIONFAILED] refused" };
+                    let verdict = if signed_in { format!("OK [CAPABILITY {caps}] welcome") } else { "NO [AUTHENTICATIONFAILED] refused".to_string() };
                     let _ = reader.get_mut().write_all(format!("{tag} {verdict}\r\n").as_bytes());
                     continue;
                 }
@@ -703,6 +715,7 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                     reply.extend(format!("{tag} NO [CANNOT] no such way to sign in\r\n").bytes());
                 } else {
                     let (user, token) = (world.user.clone(), world.token.clone());
+                    let caps = world.capabilities(secured);
                     // The rest of the exchange is read without holding the state.
                     drop(world);
                     let payload = if with_command.is_empty() {
@@ -716,7 +729,7 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                     let (given_user, given_token) = bearer(&payload);
                     if (given_user, &given_token) == (user, &token) {
                         signed_in = true;
-                        let _ = reader.get_mut().write_all(format!("{tag} OK welcome\r\n").as_bytes());
+                        let _ = reader.get_mut().write_all(format!("{tag} OK [CAPABILITY {caps}] welcome\r\n").as_bytes());
                     } else {
                         // The reasons, and after the client's empty line the verdict. A careless
                         // server: it repeats the token it was sent.
@@ -910,7 +923,13 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
             // and Gmail's `UID SEARCH UID <set> UNDELETED X-GM-RAW "category:…"`: the searches
             // asked of a server.
             "UID" if args.to_ascii_uppercase().starts_with("SEARCH ") => {
-                let said = words(args);
+                let mut said = words(args);
+                // `UID SEARCH UNDELETED UID <set> …`: the search among those messages alone.
+                let among = (said.get(2).is_some_and(|w| w.eq_ignore_ascii_case("UID")) && said.len() > 3).then(|| said.remove(3));
+                if among.is_some() {
+                    said.remove(2);
+                }
+                let within = |uid: u32| among.as_ref().is_none_or(|set| in_set(set, uid));
                 let asked = |at: usize, word: &str| said.get(at).is_some_and(|w| w.eq_ignore_ascii_case(word));
                 let texts: Vec<String> =
                     said.windows(2).filter(|pair| pair[0].eq_ignore_ascii_case("TEXT")).map(|pair| pair[1].to_ascii_lowercase()).collect();
@@ -922,7 +941,7 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                             let found: String = mailbox
                                 .messages
                                 .iter()
-                                .filter(|m| !m.has("\\Deleted"))
+                                .filter(|m| !m.has("\\Deleted") && within(m.uid))
                                 .filter(|m| {
                                     let body = String::from_utf8_lossy(&m.body).to_ascii_lowercase();
                                     texts.iter().all(|word| body.contains(word))
@@ -970,7 +989,7 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                                 let found: String = mailbox
                                     .messages
                                     .iter()
-                                    .filter(|m| !m.has("\\Deleted"))
+                                    .filter(|m| !m.has("\\Deleted") && within(m.uid))
                                     .filter(|m| {
                                         let raw = String::from_utf8_lossy(&m.body).to_ascii_lowercase();
                                         let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
@@ -996,7 +1015,7 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                         let found: String = mailbox
                             .messages
                             .iter()
-                            .filter(|m| !m.has("\\Deleted") && header_has(&m.body, &said[3], &said[4]))
+                            .filter(|m| !m.has("\\Deleted") && within(m.uid) && header_has(&m.body, &said[3], &said[4]))
                             .map(|m| format!(" {}", m.uid))
                             .collect();
                         reply.extend(format!("* SEARCH{found}\r\n{tag} OK found\r\n").bytes());
@@ -1090,6 +1109,7 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                 let (whole, header) = (items.contains("BODY.PEEK[]"), items.contains("BODY.PEEK[HEADER]"));
                 let mut refused = !fetch.eq_ignore_ascii_case("FETCH");
                 let messages = open.and_then(|i| world.mailboxes.get(i)).map_or(&[][..], |m| &m.messages[..]);
+                let open_raw = open.and_then(|i| world.mailboxes.get(i)).map_or("", |m| m.raw.as_str());
                 for (index, message) in messages.iter().enumerate().filter(|(_, m)| in_set(set, m.uid)) {
                     let (seq, uid, flags) = (index + 1, message.uid, &message.flags);
                     if whole && world.hang_up_at_uid == Some(uid) {
@@ -1120,9 +1140,15 @@ fn serve_imap(stream: TcpStream, shared: Arc<Mutex<ImapWorld>>) {
                     } else if items.contains("RFC822.SIZE") {
                         let size = message.claimed_size.unwrap_or(message.body.len() as u64);
                         reply.extend(format!("* {seq} FETCH (UID {uid} RFC822.SIZE {size})\r\n").bytes());
-                    } else if world.gmail && items.contains("X-GM-MSGID") {
-                        let id = GMAIL_IDS + u64::from(uid);
-                        reply.extend(format!("* {seq} FETCH (FLAGS ({flags}) UID {uid} X-GM-MSGID {id})\r\n").bytes());
+                    } else if world.gmail && (items.contains("X-GM-MSGID") || items.contains("X-GM-LABELS")) {
+                        let id = if items.contains("X-GM-MSGID") { format!(" X-GM-MSGID {}", GMAIL_IDS + u64::from(uid)) } else { String::new() };
+                        let labels = if items.contains("X-GM-LABELS") {
+                            let said = world.gmail_labels.iter().find(|(at, u, _)| at == open_raw && *u == uid).map_or("", |(_, _, l)| l.as_str());
+                            format!(" X-GM-LABELS ({said})")
+                        } else {
+                            String::new()
+                        };
+                        reply.extend(format!("* {seq} FETCH (FLAGS ({flags}) UID {uid}{id}{labels})\r\n").bytes());
                     } else {
                         reply.extend(format!("* {seq} FETCH (FLAGS ({flags}) UID {uid})\r\n").bytes());
                     }
@@ -1232,7 +1258,7 @@ fn serve_smtp(stream: TcpStream, shared: Arc<Mutex<SmtpWorld>>) {
                 continue;
             }
         } else if upper.starts_with("MAIL FROM:") {
-            if (world.auth || !world.token.is_empty()) && !signed_in {
+            if ((world.auth && !world.auth_optional) || !world.token.is_empty()) && !signed_in {
                 "530 5.7.0 sign in first".to_string()
             } else {
                 from = path(&line);
@@ -1241,7 +1267,9 @@ fn serve_smtp(stream: TcpStream, shared: Arc<Mutex<SmtpWorld>>) {
             }
         } else if upper.starts_with("RCPT TO:") {
             let address = path(&line);
-            if world.refuse.contains(&address) {
+            if world.deny_relay && !signed_in {
+                "554 5.7.1 <Relay access denied>".to_string()
+            } else if world.refuse.contains(&address) {
                 "550 5.1.1 no such user".to_string()
             } else {
                 recipients.push(address);
